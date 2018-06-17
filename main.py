@@ -38,6 +38,27 @@ def make_swap(start, maturity, notional, fixed_rate, index, typ=Qlb.VanillaSwap.
 
     return swap, [index.fixingDate(x) for x in floater_leg_schedule][:-1]
 
+def create_portpolio(today, index):
+    portfolio = [make_swap(today + Qlb.Period('2d'),
+                           Qlb.Period('5y'),
+                           1e8,
+                           0.03,
+                           index),
+                 make_swap(today + Qlb.Period('2d'),
+                           Qlb.Period('4y'),
+                           5e6,
+                           0.03,
+                           index,
+                           Qlb.VanillaSwap.Receiver)]
+    return portfolio
+
+def create_rng(time_grid_length):
+    seed = 1
+    urng = Qlb.MersenneTwisterUniformRng(seed)
+    usrg = Qlb.MersenneTwisterUniformRsg(time_grid_length-1, urng)
+    generator = Qlb.InvCumulativeMersenneTwisterGaussianRsg(usrg)
+    return generator
+
 def main():
     # setting evaluation date
     today = Qlb.Date(7, 4, 2015)
@@ -53,51 +74,42 @@ def main():
     t0_yieldcurve = Qlb.YieldTermStructureHandle(yield_termstructure)
     euribor6M = Qlb.Euribor6M(yield_termstructure_handle)
 
-    portfolio = [make_swap(today + Qlb.Period('2d'),
-                           Qlb.Period('5y'),
-                           1e8,
-                           0.03,
-                           euribor6M),
-                 make_swap(today + Qlb.Period('2d'),
-                           Qlb.Period('4y'),
-                           5e6,
-                           0.03,
-                           euribor6M,
-                           Qlb.VanillaSwap.Receiver)]
+    portfolio = create_portpolio(today, euribor6M)
+
     engine = Qlb.DiscountingSwapEngine(yield_termstructure_handle)
     for deal, fixing_dates in portfolio:
         deal.setPricingEngine(engine)
         deal.NPV()
         print(deal.NPV())
 
+    # volatilities of Short rate model. Assume this vols have beed already calibrated.
     volatilities = [Qlb.QuoteHandle(Qlb.SimpleQuote(0.0075)),
-         Qlb.QuoteHandle(Qlb.SimpleQuote(0.0075))]
+                    Qlb.QuoteHandle(Qlb.SimpleQuote(0.0075))]
     mean_reversion = [Qlb.QuoteHandle(Qlb.SimpleQuote(0.2))]
     model = Qlb.Gsr(t0_yieldcurve, [today+100], volatilities, mean_reversion, 16.)
-
     process = model.stateProcess()
-
+    # create date grid in 6 years
     date_grid = [today + Qlb.Period(i, Qlb.Months) for i in range(0, 12*6)]
+
     for deal in portfolio:
         date_grid += deal[1]
 
     date_grid = np.unique(np.sort(date_grid))
     time_grid = np.vectorize(lambda x: Qlb.ActualActual().yearFraction(today, x))(date_grid)
+    # dt = [time_grid[1] - time_grid[0], time_grid[2]-time_grid[1]
     dt = time_grid[1:] - time_grid[:-1]
 
     # making random number generator
-    seed = 1
-    urng = Qlb.MersenneTwisterUniformRng(seed)
-    usrg = Qlb.MersenneTwisterUniformRsg(len(time_grid)-1, urng)
-    generator = Qlb.InvCumulativeMersenneTwisterGaussianRsg(usrg)
+    generator = create_rng(len(time_grid))
 
-    N = 1500
+    N = 1500 #path number
+    # len(time_grid): indexのfixing dateか明細のcf発生日
     x = np.zeros((N, len(time_grid)))
     y = np.zeros((N, len(time_grid)))
     pillars = np.array([0.0, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-    zero_bonds = np.zeros((N, len(time_grid), 12))
+    zero_bonds = np.zeros((N, len(time_grid), len(pillars)))
 
-    for j in range(12):
+    for j in range(len(pillars)):
         zero_bonds[:, 0, j] = model.zerobond(pillars[j], 0, 0)
     for n in range(0, N):
         dWs = generator.nextSequence().value()
@@ -114,6 +126,8 @@ def main():
                 zero_bonds[n, i, j] = model.zerobond(t1+pillars[j],
                                                      t1,
                                                      y[n, i])
+
+
     for i in range(0, N):
         plt.plot(time_grid, x[i, :])
 
@@ -121,7 +135,9 @@ def main():
 
 
     npv_cube = np.zeros((N, len(date_grid), len(portfolio)))
+    # calculate NPV for each path
     for p in range(0, N):
+        # in each path, calculate NPV on each evaluation date in date_grid
         for t in range(0, len(date_grid)):
             date = date_grid[t]
             Qlb.Settings.instance().setEvaluationDate(date)
@@ -135,8 +151,10 @@ def main():
             if euribor6M.isValidFixingDate(date):
                 fixing = euribor6M.fixing(date)
                 euribor6M.addFixing(date, fixing)
+            # calculate NPV on each deal
             for i in range(len(portfolio)):
                 npv_cube[p, t, i] = portfolio[i][0].NPV()
+        # clear history on 1 path
         Qlb.IndexManager.instance().clearHistories()
     Qlb.Settings.instance().setEvaluationDate(today)
     yield_termstructure_handle.linkTo(yield_termstructure)
